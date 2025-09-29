@@ -1,1 +1,1 @@
-export * from "./React-Module";
+export * from "./lib";

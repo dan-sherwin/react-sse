@@ -1,5 +1,5 @@
 {
-  "name": "@dsherwin/react-module",
+  "name": "@dsherwin/react-sse",
   "version": "0.1.0",
   "main": "dist/index.mjs",
   "module": "dist/index.mjs",
@@ -15,7 +15,7 @@
   "license": "ISC",
   "repository": {
     "type": "git",
-    "url": "https://github.com/dan-sherwin/react-module.git"
+    "url": "https://github.com/dan-sherwin/react-sse.git"
   },
   "devDependencies": {
     "@types/react": "^19.1.15",

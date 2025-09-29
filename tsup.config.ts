@@ -9,7 +9,6 @@ export default defineConfig({
     dts: true,
     sourcemap: true,
     target: 'es2020',
-    jsx: 'automatic',
     treeshake: true,
     minify: false
 });
