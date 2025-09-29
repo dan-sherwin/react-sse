@@ -1,0 +1,33 @@
+{
+  "name": "@dsherwin/react-module",
+  "version": "0.1.0",
+  "main": "dist/index.mjs",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.mts",
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "clean": "rm -rf dist",
+    "generate:readme": "ts-node README.md.tsx"
+  },
+  "description": "React-Module",
+  "author": "Dan Sherwin",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dan-sherwin/react-module.git"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.15",
+    "jsx-readme": "^3.0.0",
+    "tslib": "^2.8.1",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.2"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "dependencies": {
+  }
+}
