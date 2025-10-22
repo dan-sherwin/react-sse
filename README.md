@@ -94,7 +94,8 @@ export interface SSEProviderProps {
 ```
 
 Behavior notes:
-- tokenLoader is called per connection when opening. Its result is appended to the URL as `?authToken=...` by default (override with `tokenQueryParam`).
+- A per-tab UID is generated and appended to every connection URL as `?uid=<uid>` so the server can target events for the active browser tab. The same UID is reused for all connections in the tab. Utilities are provided: `getClientUid()` and `isClientUid(uid)` for comparing incoming payload metadata with the current tab.
+- tokenLoader is called per connection when opening. Its result is appended to the URL as `?authToken=...` by default (override with `tokenQueryParam`). The `uid` param is placed before the token param in the URL.
 - connectOnMount defaults to true. Set `false` to declare a connection but not auto‑connect.
 - eventTypes
   - If provided and non‑empty: only those named SSE events are listened for.
@@ -113,6 +114,7 @@ export interface SSEMessage<T = unknown> {
   data?: T;        // parsed JSON if possible
   lastEventId?: string;
   timestamp: number; // ms
+  uid?: string;    // client tab UID; set by this library when available
 }
 
 export interface SSEConnectionState {
@@ -144,6 +146,9 @@ export type EventsFilter<T = unknown> = {
 
 - useSSEEvent<T = unknown>(connectionId: string | string[], type?: string | string[]): SSEMessage<T> | undefined
   - Returns only the latest event that matches the provided connection id(s) and optional type(s). The component re‑renders only when a new matching event object arrives, not for unrelated events.
+
+- useLiveSSEEvent<T = unknown>(connectionId: string | string[], type?: string | string[]): SSEMessage<T> | undefined
+  - Live-only version of useSSEEvent. It only returns events that arrive after the component mounts. It will not replay the last matching event on first render or re-renders.
 
 - useSSEManager(): { connect: (cfg: ConnectionConfig) => void; disconnect: (id: string) => void }
   - Imperative helpers to connect/disconnect at runtime.

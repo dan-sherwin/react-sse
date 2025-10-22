@@ -1,5 +1,47 @@
 import React, {createContext, PropsWithChildren, useContext, useEffect, useMemo, useRef, useSyncExternalStore} from "react";
 
+// Per-tab/browser UID utilities
+const UID_STORAGE_KEY = "@react-sse:uid";
+
+function generateUid(): string {
+  // Prefer crypto.randomUUID when available
+  try {
+    // @ts-ignore
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      // @ts-ignore
+      return crypto.randomUUID();
+    }
+  } catch {}
+  // Fallback: timestamp + random
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+let cachedUid: string | undefined;
+
+export function getClientUid(): string {
+  if (cachedUid) return cachedUid;
+  if (typeof window === "undefined") return ""; // SSR safe
+  try {
+    const ss = window.sessionStorage;
+    let uid = ss.getItem(UID_STORAGE_KEY) || "";
+    if (!uid) {
+      uid = generateUid();
+      ss.setItem(UID_STORAGE_KEY, uid);
+    }
+    cachedUid = uid;
+    return uid;
+  } catch {
+    // If sessionStorage is unavailable (e.g., privacy mode), just keep an in-memory uid
+    cachedUid = generateUid();
+    return cachedUid;
+  }
+}
+
+export function isClientUid(uid?: string | null): boolean {
+  if (!uid) return false;
+  return uid === getClientUid();
+}
+
 // Types
 export type SSEConnectionStatus = "idle" | "connecting" | "open" | "closed" | "error";
 
@@ -10,6 +52,7 @@ export interface SSEMessage<T = unknown> {
   data?: T;
   lastEventId?: string;
   timestamp: number;
+  uid?: string; // client tab UID; set by this library when available
 }
 
 export interface SSEConnectionState {
@@ -93,13 +136,26 @@ class SSEManager {
   constructor(private store: Store, private callbacks?: { onEvent?: (e: SSEMessage) => void; onOpen?: (id: string) => void; onError?: (id: string, error: unknown) => void }) {}
 
   private buildUrl(urlStr: string, token: string, tokenQueryParam = "authToken") {
+    const uid = getClientUid();
     try {
       const url = new URL(urlStr, typeof window !== "undefined" ? window.location.origin : undefined);
+      // Ensure uid param is added prior to token param (ordering of URLSearchParams is preserved in toString)
+      if (uid) url.searchParams.set("uid", uid);
       if (token) url.searchParams.set(tokenQueryParam || "authToken", token);
       return url.toString();
     } catch {
-      const sep = urlStr.includes("?") ? "&" : "?";
-      return `${urlStr}${sep}${encodeURIComponent(tokenQueryParam || "authToken")}=${encodeURIComponent(token)}`;
+      // Fallback string manipulation if URL constructor fails (e.g., non-standard schemes)
+      const hasQuery = urlStr.includes("?");
+      const parts: string[] = [];
+      if (uid) parts.push(`uid=${encodeURIComponent(uid)}`);
+      if (token) parts.push(`${encodeURIComponent(tokenQueryParam || "authToken")}=${encodeURIComponent(token)}`);
+      if (!hasQuery) {
+        return `${urlStr}?${parts.join("&")}`;
+      } else {
+        // Append ensuring uid appears before token
+        const sep = urlStr.endsWith("?") || urlStr.endsWith("&") ? "" : "&";
+        return `${urlStr}${sep}${parts.join("&")}`;
+      }
     }
   }
 
@@ -143,6 +199,7 @@ class SSEManager {
             dataStr: ev.data,
             lastEventId: (ev as any).lastEventId,
             timestamp: Date.now(),
+            uid: getClientUid(),
           };
           try { msg.data = JSON.parse(ev.data); } catch {}
           this.store.pushEvent(msg);
@@ -281,6 +338,31 @@ export function useSSEEvent<T = unknown>(connectionId: string | string[], type?:
     const typeSet = (type === undefined) ? undefined : new Set(Array.isArray(type) ? type : [type]);
     for (let i = arr.length - 1; i >= 0; i--) {
       const e = arr[i];
+      if (!idSet.has(e.connectionId)) continue;
+      if (typeSet && !typeSet.has(e.type)) continue;
+      return e;
+    }
+    return undefined;
+  });
+}
+
+export function useLiveSSEEvent<T = unknown>(connectionId: string, type?: string): SSEMessage<T> | undefined;
+export function useLiveSSEEvent<T = unknown>(connectionId: string[], type?: string | string[]): SSEMessage<T> | undefined;
+export function useLiveSSEEvent<T = unknown>(connectionId: string | string[], type?: string | string[]) {
+  // Only emit events that arrive after this hook mounts. We record a mount
+  // timestamp once, and then select the most recent matching event whose
+  // timestamp is >= that value. Older (replayed) events will be ignored.
+  const mountTsRef = useRef<number>(0);
+  if (mountTsRef.current === 0) mountTsRef.current = Date.now();
+
+  return useStoreSelector((s) => {
+    const arr = s.events as SSEMessage<T>[];
+    const idSet = new Set(Array.isArray(connectionId) ? connectionId : [connectionId]);
+    const typeSet = (type === undefined) ? undefined : new Set(Array.isArray(type) ? type : [type]);
+    const since = mountTsRef.current!;
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const e = arr[i];
+      if (e.timestamp < since) break; // remaining are older than mount
       if (!idSet.has(e.connectionId)) continue;
       if (typeSet && !typeSet.has(e.type)) continue;
       return e;
