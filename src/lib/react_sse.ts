@@ -66,10 +66,12 @@ export interface SSEConnectionState {
 export interface ConnectionConfig {
   id: string;
   url: string;
-  tokenLoader: () => Promise<string>;
+  tokenLoader?: () => Promise<string>; // optional; when omitted or empty, no token param is appended
   tokenQueryParam?: string; // defaults to "authToken"
   connectOnMount?: boolean; // defaults to true
   eventTypes?: string[]; // custom SSE event names to listen for (defaults to ['message'])
+  withCredentials?: boolean; // when true, passes { withCredentials: true } to EventSource init
+  eventSourceInit?: EventSourceInit; // full control over EventSource init options (overrides withCredentials)
 }
 
 export interface SSEProviderProps extends PropsWithChildren {
@@ -165,19 +167,22 @@ class SSEManager {
 
     this.store.setConnection({ id: cfg.id, url: cfg.url, status: "connecting" });
 
-    // Fetch token asynchronously per-connection, then open EventSource
+    // Fetch token asynchronously per-connection if provided, then open EventSource
     (async () => {
-      let token: string;
-      try {
-        token = await cfg.tokenLoader();
-      } catch (e) {
-        this.store.setConnection({ id: cfg.id, url: cfg.url, status: "error", error: `token: ${String(e)}` });
-        this.callbacks?.onError?.(cfg.id, e);
-        return;
+      let token = "";
+      if (cfg.tokenLoader) {
+        try {
+          token = await cfg.tokenLoader();
+        } catch (e) {
+          this.store.setConnection({ id: cfg.id, url: cfg.url, status: "error", error: `token: ${String(e)}` });
+          this.callbacks?.onError?.(cfg.id, e);
+          return;
+        }
       }
 
-      const fullUrl = this.buildUrl(cfg.url, token, cfg.tokenQueryParam ?? "authToken");
-      const es = new EventSource(fullUrl);
+      const fullUrl = this.buildUrl(cfg.url, token || "", cfg.tokenQueryParam ?? "authToken");
+      const init = cfg.eventSourceInit ?? (cfg.withCredentials ? { withCredentials: true } as EventSourceInit : undefined);
+      const es = init ? new EventSource(fullUrl, init) : new EventSource(fullUrl);
       this.sources.set(cfg.id, es);
 
       es.addEventListener("open", () => {
