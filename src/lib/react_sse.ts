@@ -61,6 +61,9 @@ export interface SSEConnectionState {
   status: SSEConnectionStatus;
   lastEvent?: SSEMessage;
   error?: string;
+  consecutiveErrorCount?: number;
+  lastErrorAt?: number;
+  lastOpenAt?: number;
 }
 
 export interface ConnectionConfig {
@@ -81,6 +84,8 @@ export interface SSEProviderProps extends PropsWithChildren {
   onEvent?: (e: SSEMessage) => void;
   onOpen?: (id: string) => void;
   onError?: (id: string, error: unknown) => void;
+  onReconnect?: (id: string) => void; // fires when an 'open' occurs after at least one error since last open
+  onStatusChange?: (id: string, status: SSEConnectionStatus, state: SSEConnectionState) => void; // called whenever status transitions
 }
 
 // Internal store
@@ -135,7 +140,11 @@ class Store {
 
 class SSEManager {
   private sources = new Map<string, EventSource>();
-  constructor(private store: Store, private callbacks?: { onEvent?: (e: SSEMessage) => void; onOpen?: (id: string) => void; onError?: (id: string, error: unknown) => void }) {}
+  private meta = new Map<string, { consecutiveErrorCount: number; hadErrorSinceOpen: boolean }>();
+  constructor(
+    private store: Store,
+    private callbacks?: { onEvent?: (e: SSEMessage) => void; onOpen?: (id: string) => void; onError?: (id: string, error: unknown) => void; onReconnect?: (id: string) => void; onStatusChange?: (id: string, status: SSEConnectionStatus, state: SSEConnectionState) => void }
+  ) {}
 
   private buildUrl(urlStr: string, token: string, tokenQueryParam = "authToken") {
     const uid = getClientUid();
@@ -166,6 +175,7 @@ class SSEManager {
     if (this.sources.has(cfg.id)) return; // already connected/connecting
 
     this.store.setConnection({ id: cfg.id, url: cfg.url, status: "connecting" });
+    this.callbacks?.onStatusChange?.(cfg.id, "connecting", { id: cfg.id, url: cfg.url, status: "connecting" });
 
     // Fetch token asynchronously per-connection if provided, then open EventSource
     (async () => {
@@ -184,14 +194,31 @@ class SSEManager {
       const init = cfg.eventSourceInit ?? (cfg.withCredentials ? { withCredentials: true } as EventSourceInit : undefined);
       const es = init ? new EventSource(fullUrl, init) : new EventSource(fullUrl);
       this.sources.set(cfg.id, es);
+      // init meta for this connection
+      this.meta.set(cfg.id, { consecutiveErrorCount: 0, hadErrorSinceOpen: false });
 
       es.addEventListener("open", () => {
-        this.store.setConnection({ id: cfg.id, url: fullUrl, status: "open" });
+        const m = this.meta.get(cfg.id) || { consecutiveErrorCount: 0, hadErrorSinceOpen: false };
+        const isReconnect = m.hadErrorSinceOpen;
+        // reset error tracking on successful open
+        m.consecutiveErrorCount = 0;
+        m.hadErrorSinceOpen = false;
+        this.meta.set(cfg.id, m);
+        const state: SSEConnectionState = { id: cfg.id, url: fullUrl, status: "open", consecutiveErrorCount: m.consecutiveErrorCount, lastOpenAt: Date.now() };
+        this.store.setConnection(state);
+        this.callbacks?.onStatusChange?.(cfg.id, "open", state);
+        if (isReconnect) this.callbacks?.onReconnect?.(cfg.id);
         this.callbacks?.onOpen?.(cfg.id);
       });
 
       es.addEventListener("error", (err: Event) => {
-        this.store.setConnection({ id: cfg.id, url: fullUrl, status: "error", error: String((err as any)?.message ?? "SSE error") });
+        const m = this.meta.get(cfg.id) || { consecutiveErrorCount: 0, hadErrorSinceOpen: false };
+        m.consecutiveErrorCount += 1;
+        m.hadErrorSinceOpen = true;
+        this.meta.set(cfg.id, m);
+        const state: SSEConnectionState = { id: cfg.id, url: fullUrl, status: "error", error: String((err as any)?.message ?? "SSE error"), consecutiveErrorCount: m.consecutiveErrorCount, lastErrorAt: Date.now() };
+        this.store.setConnection(state);
+        this.callbacks?.onStatusChange?.(cfg.id, "error", state);
         this.callbacks?.onError?.(cfg.id, err);
       });
 
@@ -220,7 +247,12 @@ class SSEManager {
       src.close();
       this.sources.delete(id);
     }
+    // mark closed before removal so onStatusChange can see it
+    const prev = this.meta.get(id) || { consecutiveErrorCount: 0, hadErrorSinceOpen: false };
+    const state: SSEConnectionState = { id, url: (this.store.getState().connections[id]?.url || ''), status: 'closed', consecutiveErrorCount: prev.consecutiveErrorCount } as any;
+    this.callbacks?.onStatusChange?.(id, 'closed', state);
     this.store.removeConnection(id);
+    this.meta.delete(id);
   }
 
   disconnectAll() {
@@ -240,16 +272,16 @@ interface CtxValue {
 
 const SSECtx = createContext<CtxValue | null>(null);
 
-export function SSEProvider({ connections = [], maxEvents = 500, enabled = true, onEvent, onOpen, onError, children }: SSEProviderProps) {
+export function SSEProvider({ connections = [], maxEvents = 500, enabled = true, onEvent, onOpen, onError, onReconnect, onStatusChange, children }: SSEProviderProps) {
   const storeRef = useRef<Store>(null);
   if (!storeRef.current) storeRef.current = new Store(maxEvents);
   const mgrRef = useRef<SSEManager>(null);
-  if (!mgrRef.current) mgrRef.current = new SSEManager(storeRef.current, { onEvent, onOpen, onError });
+  if (!mgrRef.current) mgrRef.current = new SSEManager(storeRef.current, { onEvent, onOpen, onError, onReconnect, onStatusChange });
 
   // Recreate manager when callbacks change
   useEffect(() => {
-    mgrRef.current = new SSEManager(storeRef.current!, { onEvent, onOpen, onError });
-  }, [onEvent, onOpen, onError]);
+    mgrRef.current = new SSEManager(storeRef.current!, { onEvent, onOpen, onError, onReconnect, onStatusChange });
+  }, [onEvent, onOpen, onError, onReconnect, onStatusChange]);
 
   const ctx = useMemo<CtxValue>(() => ({
     store: storeRef.current!,
