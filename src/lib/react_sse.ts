@@ -92,13 +92,14 @@ export interface SSEProviderProps extends PropsWithChildren {
 interface InternalState {
   connections: Record<string, SSEConnectionState>;
   events: SSEMessage[];
+  latestEvents: Record<string, SSEMessage>; // connectionId:type -> SSEMessage
 }
 
 type Listener = () => void;
 
 class Store {
   constructor(private maxEvents: number) {}
-  private state: InternalState = { connections: {}, events: [] };
+  private state: InternalState = { connections: {}, events: [], latestEvents: {} };
   private listeners = new Set<Listener>();
 
   getState = () => this.state;
@@ -115,16 +116,28 @@ class Store {
 
   removeConnection(id: string) {
     const { [id]: _removed, ...rest } = this.state.connections;
-    this.state = { ...this.state, connections: rest };
+    // Also remove latest events for this connection
+    const nextLatest = { ...this.state.latestEvents };
+    for (const key in nextLatest) {
+      if (key.startsWith(`${id}:`)) delete nextLatest[key];
+    }
+    this.state = { ...this.state, connections: rest, latestEvents: nextLatest };
     this.notify();
   }
 
   pushEvent(msg: SSEMessage) {
-    const events = [...this.state.events, msg];
-    if (events.length > this.maxEvents) events.splice(0, events.length - this.maxEvents);
+    const events = [...this.state.events, msg].slice(-this.maxEvents);
+    const typeKey = `${msg.connectionId}:${msg.type}`;
+    const anyKey = `${msg.connectionId}:*`;
+    
     this.state = {
       ...this.state,
       events,
+      latestEvents: {
+        ...this.state.latestEvents,
+        [typeKey]: msg,
+        [anyKey]: msg,
+      },
       connections: {
         ...this.state.connections,
         [msg.connectionId]: {
@@ -141,21 +154,24 @@ class Store {
 class SSEManager {
   private sources = new Map<string, EventSource>();
   private meta = new Map<string, { consecutiveErrorCount: number; hadErrorSinceOpen: boolean }>();
-  constructor(
-    private store: Store,
-    private callbacks?: { onEvent?: (e: SSEMessage) => void; onOpen?: (id: string) => void; onError?: (id: string, error: unknown) => void; onReconnect?: (id: string) => void; onStatusChange?: (id: string, status: SSEConnectionStatus, state: SSEConnectionState) => void }
-  ) {}
+  public callbacks: {
+    onEvent?: (e: SSEMessage) => void;
+    onOpen?: (id: string) => void;
+    onError?: (id: string, error: unknown) => void;
+    onReconnect?: (id: string) => void;
+    onStatusChange?: (id: string, status: SSEConnectionStatus, state: SSEConnectionState) => void;
+  } = {};
+
+  constructor(private store: Store) {}
 
   private buildUrl(urlStr: string, token: string, tokenQueryParam = "authToken") {
     const uid = getClientUid();
     try {
       const url = new URL(urlStr, typeof window !== "undefined" ? window.location.origin : undefined);
-      // Ensure uid param is added prior to token param (ordering of URLSearchParams is preserved in toString)
       if (uid) url.searchParams.set("uid", uid);
       if (token) url.searchParams.set(tokenQueryParam || "authToken", token);
       return url.toString();
     } catch {
-      // Fallback string manipulation if URL constructor fails (e.g., non-standard schemes)
       const hasQuery = urlStr.includes("?");
       const parts: string[] = [];
       if (uid) parts.push(`uid=${encodeURIComponent(uid)}`);
@@ -163,7 +179,6 @@ class SSEManager {
       if (!hasQuery) {
         return `${urlStr}?${parts.join("&")}`;
       } else {
-        // Append ensuring uid appears before token
         const sep = urlStr.endsWith("?") || urlStr.endsWith("&") ? "" : "&";
         return `${urlStr}${sep}${parts.join("&")}`;
       }
@@ -171,13 +186,12 @@ class SSEManager {
   }
 
   connect(cfg: ConnectionConfig) {
-    if (typeof window === "undefined" || typeof window.EventSource === "undefined") return; // SSR no-op
-    if (this.sources.has(cfg.id)) return; // already connected/connecting
+    if (typeof window === "undefined" || typeof window.EventSource === "undefined") return;
+    if (this.sources.has(cfg.id)) return;
 
     this.store.setConnection({ id: cfg.id, url: cfg.url, status: "connecting" });
-    this.callbacks?.onStatusChange?.(cfg.id, "connecting", { id: cfg.id, url: cfg.url, status: "connecting" });
+    this.callbacks.onStatusChange?.(cfg.id, "connecting", { id: cfg.id, url: cfg.url, status: "connecting" });
 
-    // Fetch token asynchronously per-connection if provided, then open EventSource
     (async () => {
       let token = "";
       if (cfg.tokenLoader) {
@@ -185,7 +199,7 @@ class SSEManager {
           token = await cfg.tokenLoader();
         } catch (e) {
           this.store.setConnection({ id: cfg.id, url: cfg.url, status: "error", error: `token: ${String(e)}` });
-          this.callbacks?.onError?.(cfg.id, e);
+          this.callbacks.onError?.(cfg.id, e);
           return;
         }
       }
@@ -194,21 +208,19 @@ class SSEManager {
       const init = cfg.eventSourceInit ?? (cfg.withCredentials ? { withCredentials: true } as EventSourceInit : undefined);
       const es = init ? new EventSource(fullUrl, init) : new EventSource(fullUrl);
       this.sources.set(cfg.id, es);
-      // init meta for this connection
       this.meta.set(cfg.id, { consecutiveErrorCount: 0, hadErrorSinceOpen: false });
 
       es.addEventListener("open", () => {
         const m = this.meta.get(cfg.id) || { consecutiveErrorCount: 0, hadErrorSinceOpen: false };
         const isReconnect = m.hadErrorSinceOpen;
-        // reset error tracking on successful open
         m.consecutiveErrorCount = 0;
         m.hadErrorSinceOpen = false;
         this.meta.set(cfg.id, m);
         const state: SSEConnectionState = { id: cfg.id, url: fullUrl, status: "open", consecutiveErrorCount: m.consecutiveErrorCount, lastOpenAt: Date.now() };
         this.store.setConnection(state);
-        this.callbacks?.onStatusChange?.(cfg.id, "open", state);
-        if (isReconnect) this.callbacks?.onReconnect?.(cfg.id);
-        this.callbacks?.onOpen?.(cfg.id);
+        this.callbacks.onStatusChange?.(cfg.id, "open", state);
+        if (isReconnect) this.callbacks.onReconnect?.(cfg.id);
+        this.callbacks.onOpen?.(cfg.id);
       });
 
       es.addEventListener("error", (err: Event) => {
@@ -218,8 +230,8 @@ class SSEManager {
         this.meta.set(cfg.id, m);
         const state: SSEConnectionState = { id: cfg.id, url: fullUrl, status: "error", error: String((err as any)?.message ?? "SSE error"), consecutiveErrorCount: m.consecutiveErrorCount, lastErrorAt: Date.now() };
         this.store.setConnection(state);
-        this.callbacks?.onStatusChange?.(cfg.id, "error", state);
-        this.callbacks?.onError?.(cfg.id, err);
+        this.callbacks.onStatusChange?.(cfg.id, "error", state);
+        this.callbacks.onError?.(cfg.id, err);
       });
 
       const types = (cfg.eventTypes && cfg.eventTypes.length ? cfg.eventTypes : ["message"]).slice();
@@ -233,9 +245,13 @@ class SSEManager {
             timestamp: Date.now(),
             uid: getClientUid(),
           };
-          try { msg.data = JSON.parse(ev.data); } catch {}
+          // Basic heuristic to avoid parsing non-JSON
+          const d = ev.data;
+          if (d && (d[0] === "{" || d[0] === "[" || d === "true" || d === "false" || d === "null" || !isNaN(Number(d)))) {
+            try { msg.data = JSON.parse(d); } catch {}
+          }
           this.store.pushEvent(msg);
-          this.callbacks?.onEvent?.(msg);
+          this.callbacks.onEvent?.(msg);
         });
       }
     })();
@@ -247,10 +263,9 @@ class SSEManager {
       src.close();
       this.sources.delete(id);
     }
-    // mark closed before removal so onStatusChange can see it
     const prev = this.meta.get(id) || { consecutiveErrorCount: 0, hadErrorSinceOpen: false };
     const state: SSEConnectionState = { id, url: (this.store.getState().connections[id]?.url || ''), status: 'closed', consecutiveErrorCount: prev.consecutiveErrorCount } as any;
-    this.callbacks?.onStatusChange?.(id, 'closed', state);
+    this.callbacks.onStatusChange?.(id, 'closed', state);
     this.store.removeConnection(id);
     this.meta.delete(id);
   }
@@ -276,11 +291,11 @@ export function SSEProvider({ connections = [], maxEvents = 500, enabled = true,
   const storeRef = useRef<Store>(null);
   if (!storeRef.current) storeRef.current = new Store(maxEvents);
   const mgrRef = useRef<SSEManager>(null);
-  if (!mgrRef.current) mgrRef.current = new SSEManager(storeRef.current, { onEvent, onOpen, onError, onReconnect, onStatusChange });
+  if (!mgrRef.current) mgrRef.current = new SSEManager(storeRef.current);
 
-  // Recreate manager when callbacks change
+  // Update manager callbacks without recreating the instance
   useEffect(() => {
-    mgrRef.current = new SSEManager(storeRef.current!, { onEvent, onOpen, onError, onReconnect, onStatusChange });
+    mgrRef.current!.callbacks = { onEvent, onOpen, onError, onReconnect, onStatusChange };
   }, [onEvent, onOpen, onError, onReconnect, onStatusChange]);
 
   const ctx = useMemo<CtxValue>(() => ({
@@ -318,12 +333,14 @@ export function useSSEConnection(id: string) {
 }
 
 export function useSSEConnections(ids?: string[]) {
-  return useStoreSelector((s) => {
-    if (!ids) return s.connections;
+  const connections = useStoreSelector((s) => s.connections);
+  const idsKey = ids?.join("|") ?? "";
+  return useMemo(() => {
+    if (!ids) return connections;
     const out: Record<string, SSEConnectionState> = {};
-    for (const id of ids) if (s.connections[id]) out[id] = s.connections[id];
+    for (const id of ids) if (connections[id]) out[id] = connections[id];
     return out;
-  });
+  }, [connections, idsKey]);
 }
 
 export type EventsFilter<T = unknown> = {
@@ -334,22 +351,17 @@ export type EventsFilter<T = unknown> = {
 };
 
 export function useSSEEvents<T = unknown>(filter?: EventsFilter<T>) {
-  // Get a stable snapshot of the raw events array from the store.
-  // IMPORTANT: useSyncExternalStore compares snapshots by reference,
-  // so we must return the same reference when the store hasn't changed.
   const events = useStoreSelector((s) => s.events as SSEMessage<T>[]);
 
-  // If no filter provided, return the raw events reference directly
-  // to preserve referential stability and avoid extra renders.
-  if (!filter) return events;
+  const connIdsKey = filter?.connectionIds?.join("|") ?? "";
+  const typesKey = filter?.types?.join("|") ?? "";
+  const sinceTs = filter?.sinceTs;
+  const predicate = filter?.predicate;
 
-  // Apply filtering in a memo so that the snapshot from the store remains
-  // referentially stable across renders when the store hasn't changed.
-  const connIdsKey = filter.connectionIds?.join("|") ?? "";
-  const typesKey = filter.types?.join("|") ?? "";
-  return React.useMemo(() => {
+  return useMemo(() => {
+    if (!filter) return events;
     let out = events;
-    if (filter.sinceTs) out = out.filter((e) => e.timestamp >= filter.sinceTs!);
+    if (sinceTs) out = out.filter((e) => e.timestamp >= sinceTs);
     if (filter.connectionIds && filter.connectionIds.length) {
       const set = new Set(filter.connectionIds);
       out = out.filter((e) => set.has(e.connectionId));
@@ -358,18 +370,20 @@ export function useSSEEvents<T = unknown>(filter?: EventsFilter<T>) {
       const set = new Set(filter.types);
       out = out.filter((e) => set.has(e.type));
     }
-    if (filter.predicate) out = out.filter(filter.predicate);
+    if (predicate) out = out.filter(predicate);
     return out;
-  }, [events, filter.sinceTs, connIdsKey, typesKey, filter.predicate]);
+  }, [events, sinceTs, connIdsKey, typesKey, predicate, !!filter]);
 }
 
 export function useSSEEvent<T = unknown>(connectionId: string, type?: string): SSEMessage<T> | undefined;
 export function useSSEEvent<T = unknown>(connectionId: string[], type?: string | string[]): SSEMessage<T> | undefined;
 export function useSSEEvent<T = unknown>(connectionId: string | string[], type?: string | string[]) {
-  // Select the latest matching event by reference so the value is stable
-  // across unrelated store updates. The component will only re-render when
-  // a NEW matching event object is pushed into the store.
   return useStoreSelector((s) => {
+    if (typeof connectionId === "string" && (type === undefined || typeof type === "string")) {
+      const key = type ? `${connectionId}:${type}` : `${connectionId}:*`;
+      return s.latestEvents[key] as SSEMessage<T>;
+    }
+
     const arr = s.events as SSEMessage<T>[];
     const idSet = new Set(Array.isArray(connectionId) ? connectionId : [connectionId]);
     const typeSet = (type === undefined) ? undefined : new Set(Array.isArray(type) ? type : [type]);
@@ -386,20 +400,23 @@ export function useSSEEvent<T = unknown>(connectionId: string | string[], type?:
 export function useLiveSSEEvent<T = unknown>(connectionId: string, type?: string): SSEMessage<T> | undefined;
 export function useLiveSSEEvent<T = unknown>(connectionId: string[], type?: string | string[]): SSEMessage<T> | undefined;
 export function useLiveSSEEvent<T = unknown>(connectionId: string | string[], type?: string | string[]) {
-  // Only emit events that arrive after this hook mounts. We record a mount
-  // timestamp once, and then select the most recent matching event whose
-  // timestamp is >= that value. Older (replayed) events will be ignored.
   const mountTsRef = useRef<number>(0);
   if (mountTsRef.current === 0) mountTsRef.current = Date.now();
 
   return useStoreSelector((s) => {
+    if (typeof connectionId === "string" && (type === undefined || typeof type === "string")) {
+      const key = type ? `${connectionId}:${type}` : `${connectionId}:*`;
+      const msg = s.latestEvents[key];
+      return (msg && msg.timestamp >= mountTsRef.current!) ? msg as SSEMessage<T> : undefined;
+    }
+
     const arr = s.events as SSEMessage<T>[];
     const idSet = new Set(Array.isArray(connectionId) ? connectionId : [connectionId]);
     const typeSet = (type === undefined) ? undefined : new Set(Array.isArray(type) ? type : [type]);
     const since = mountTsRef.current!;
     for (let i = arr.length - 1; i >= 0; i--) {
       const e = arr[i];
-      if (e.timestamp < since) break; // remaining are older than mount
+      if (e.timestamp < since) break;
       if (!idSet.has(e.connectionId)) continue;
       if (typeSet && !typeSet.has(e.type)) continue;
       return e;
