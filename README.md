@@ -8,6 +8,8 @@ Key features:
 - Bounded, global event buffer (ring buffer)
 - Simple hooks to read connection status, all events, or only the latest matching event
 - Flexible filtering without causing render loops
+- Automatic per-tab `uid` query parameter support for server-side targeting and replay helpers
+- Declarative connection diffing so equivalent rerenders do not tear down active streams
 - **Built-in Testing Support**: Modern testing setup with Vitest and React Testing Library.
 
 ## Installation
@@ -52,6 +54,14 @@ function Header() {
 }
 ```
 
+## Connection Notes
+
+- `uid` is automatically appended to each connection URL and persisted per browser tab via `sessionStorage`.
+- If `tokenLoader` resolves a value, it is appended as the `authToken` query parameter by default. Override the parameter name with `tokenQueryParam`.
+- Use `withCredentials: true` when your backend expects cookie-based auth.
+- Named SSE events must be listed in `eventTypes`; otherwise the provider only listens for the default `message` event.
+- The provider compares connection definitions by effective config, so rerendering with equivalent connection arrays will not force unnecessary reconnects.
+
 ## Testing
 
 This project uses [Vitest](https://vitest.dev/) for unit testing.
@@ -73,6 +83,7 @@ npm test -- --run
 - `useSSEEvents(filter?)`: Subscribe to the global event buffer.
 - `useSSEEvent(connectionId, type?)`: Get only the latest matching event.
 - `useLiveSSEEvent(connectionId, type?)`: Only returns events that arrive after mount.
+- `useSSEManager()`: Imperative `connect` and `disconnect` helpers.
 
 ## License
 

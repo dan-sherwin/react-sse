@@ -1,6 +1,6 @@
 {
   "name": "@dsherwin/react-sse",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "main": "dist/index.mjs",
   "module": "dist/index.mjs",
   "types": "dist/index.d.mts",
@@ -10,7 +10,7 @@
     "clean": "rm -rf dist",
     "test": "vitest"
   },
-  "description": "React-Module",
+  "description": "React hooks and provider utilities for Server-Sent Events",
   "author": "Dan Sherwin",
   "license": "ISC",
   "repository": {

@@ -88,6 +88,30 @@ export interface SSEProviderProps extends PropsWithChildren {
   onStatusChange?: (id: string, status: SSEConnectionStatus, state: SSEConnectionState) => void; // called whenever status transitions
 }
 
+function areStringArraysEqual(a?: string[], b?: string[]) {
+  if (a === b) return true;
+  if (!a || !b) return !a && !b;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function areConnectionConfigsEquivalent(a: ConnectionConfig, b: ConnectionConfig) {
+  // Intentionally ignore tokenLoader function identity so parent rerenders do not
+  // force reconnect churn when the connection semantics have not actually changed.
+  return (
+    a.id === b.id &&
+    a.url === b.url &&
+    (a.tokenQueryParam ?? "authToken") === (b.tokenQueryParam ?? "authToken") &&
+    (a.connectOnMount ?? true) === (b.connectOnMount ?? true) &&
+    (a.withCredentials ?? false) === (b.withCredentials ?? false) &&
+    (a.eventSourceInit?.withCredentials ?? false) === (b.eventSourceInit?.withCredentials ?? false) &&
+    areStringArraysEqual(a.eventTypes, b.eventTypes)
+  );
+}
+
 // Internal store
 interface InternalState {
   connections: Record<string, SSEConnectionState>;
@@ -292,6 +316,7 @@ export function SSEProvider({ connections = [], maxEvents = 500, enabled = true,
   if (!storeRef.current) storeRef.current = new Store(maxEvents);
   const mgrRef = useRef<SSEManager>(null);
   if (!mgrRef.current) mgrRef.current = new SSEManager(storeRef.current);
+  const activeConnectionsRef = useRef<Map<string, ConnectionConfig>>(new Map());
 
   // Update manager callbacks without recreating the instance
   useEffect(() => {
@@ -307,11 +332,53 @@ export function SSEProvider({ connections = [], maxEvents = 500, enabled = true,
 
   // Declarative connections
   useEffect(() => {
-    if (!enabled) return;
-    const toConnect = connections.filter((c) => c.connectOnMount !== false);
-    toConnect.forEach((c) => ctx.connect(c));
-    return () => { toConnect.forEach((c) => ctx.disconnect(c.id)); };
+    const manager = mgrRef.current!;
+    const previousConnections = activeConnectionsRef.current;
+    const nextConnections = new Map<string, ConnectionConfig>();
+
+    for (const cfg of connections) {
+      nextConnections.set(cfg.id, cfg);
+    }
+
+    if (!enabled) {
+      for (const id of previousConnections.keys()) {
+        manager.disconnect(id);
+      }
+      activeConnectionsRef.current = new Map();
+      return;
+    }
+
+    for (const [id, prevCfg] of previousConnections) {
+      const nextCfg = nextConnections.get(id);
+      if (!nextCfg || nextCfg.connectOnMount === false) {
+        manager.disconnect(id);
+        continue;
+      }
+      if (!areConnectionConfigsEquivalent(prevCfg, nextCfg)) {
+        manager.disconnect(id);
+      }
+    }
+
+    for (const [id, cfg] of nextConnections) {
+      if (cfg.connectOnMount === false) continue;
+      const prevCfg = previousConnections.get(id);
+      if (!prevCfg || !areConnectionConfigsEquivalent(prevCfg, cfg)) {
+        manager.connect(cfg);
+      }
+    }
+
+    activeConnectionsRef.current = nextConnections;
   }, [enabled, connections]);
+
+  useEffect(() => {
+    return () => {
+      const manager = mgrRef.current!;
+      for (const id of activeConnectionsRef.current.keys()) {
+        manager.disconnect(id);
+      }
+      activeConnectionsRef.current = new Map();
+    };
+  }, []);
 
   return React.createElement(SSECtx.Provider, { value: ctx }, children);
 }
